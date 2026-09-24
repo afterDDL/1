@@ -277,6 +277,248 @@ def _extract_deltas(html: str):
     return out
 
 
+# --------------------------------------------------------------------------
+# 2.4 文案本地化：把上游的英文样板与「下一步指引」翻成中文，并把指引改成合并工具的调用式
+#
+# 为什么必须做：上游的指引写的是 "Call the 'updateGame' tool ..."，
+# 但合并后平台上只存在一个工具 rpg。模型照做会去调一个不存在的工具名 → 直接失败。
+# 顺带把整段样板中文化，智能体的 system prompt 就能缩到几条铁律。
+# --------------------------------------------------------------------------
+# 整行精确替换
+_LINE_MAP = {
+    "📋 Game Context:": "📋 局面",
+    "📝 What Happened:": "📝 发生了什么：",
+    "🎯 Next Step:": "🎯 下一步（照做即可）：",
+    "📌 Additional Notes:": "📌 备注：",
+    "⏸️ Status:": "⏸️ 状态：",
+    "- Deltas displayed and cleared": "- 变化已展示并清空",
+    "- Ready to start fresh": "- 可以开新局了",
+    "- Story: Not started": "- 剧情：尚未开始",
+    "- Game ended at": "- 本局结束时间",
+    "- Total decisions made": "- 累计决策次数",
+    "- Previous game summary provided for context": "- 已附上一局摘要供参考",
+    "- Player is ready for a new adventure": "- 玩家已准备开新局",
+    "- Consider lessons learned from previous game when creating new one": "- 开新局时可参考上一局的得失",
+    "- PAUSED: Waiting for player to select an option via UI": "- 已暂停：等玩家选择",
+    "- selectAction will be called automatically when player clicks a button":
+        "- 玩家回复序号后，由你调用 rpg(action=\"selectAction\")",
+    "- Do not proceed until selectAction is invoked": "- 玩家没选之前不要继续推进",
+    "- Determine consequences based on the selected action and current game state":
+        "- 根据玩家这次的选择与当前局面决定后果",
+    "- You may need to call updateGame multiple times for complex outcomes":
+        "- 后果复杂时可以分多次 updateGame",
+    "- After all updates, call progressStory to narrate the results":
+        "- 改完之后用 progressStory 叙述结果",
+    "- You may call updateGame multiple times to apply multiple changes":
+        "- 可以分多次 updateGame 把变化都写进去",
+    "- Call progressStory after all updates to narrate the cumulative results":
+        "- 全部改完后用 progressStory 叙述累计结果",
+    "- Players need diverse choices with varying consequences for engaging gameplay":
+        "- 各选项的后果要不同，别都一个样",
+    "- Ensure options provide both safe and risky alternatives": "- 选项里要既有稳妥的也有冒险的",
+    "- Avoid making all options have similar outcomes": "- 避免所有选项结局雷同",
+    "- This is a read-only operation": "- 这是只读操作，不改局面",
+    "- Player options: None": "- 玩家可选项：无",
+    "- Player selection: Pending": "- 玩家选择：等玩家选",
+    "- Player options": "- 玩家可选项",
+    "- Player selection": "- 玩家选择",
+    "- Pending deltas: 0": "- 待显示变化数：0",
+    "- Story progress: Not started": "- 剧情进度：尚未开始",
+}
+# 前缀替换（保留冒号后面的动态内容）
+_PREFIX_MAP = [
+    ("✅ ", "✅ "),  # 占位，具体在正则里处理
+]
+# 行首标签替换
+_LABEL_MAP = [
+    ("- Game ID:", "- 局号:"),
+    ("- Title:", "- 局名:"),
+    ("- Characters:", "- 角色数:"),
+    ("- Location:", "- 位置:"),
+    ("- Created:", "- 创建时间:"),
+    ("- Last updated:", "- 更新时间:"),
+    ("- Chapter:", "- 章节:"),
+    ("- Pending deltas:", "- 待显示变化数:"),
+    ("- Situation:", "- 当前处境:"),
+    ("- Options presented:", "- 已给出选项数:"),
+    ("- Selected:", "- 玩家选择:"),
+    ("- History:", "- 历史记录:"),
+    ("- Updated field:", "- 已修改字段:"),
+    ("- New value:", "- 新值:"),
+    ("- Pending changes:", "- 待显示变更数:"),
+    ("- Total decisions made:", "- 累计决策次数:"),
+    ("- Game ended at:", "- 本局结束时间:"),
+    ("- Story progress:", "- 剧情进度:"),
+    ("- Story:", "- 剧情:"),
+    ("- Created:", "- 创建时间:"),
+    ("- Updated field", "- 已修改字段"),
+]
+# 句子/片段替换（顺序有意义，长的在前）
+_PHRASE_MAP = [
+    ("Call the 'promptUserActions' tool with these parameters:",
+     "调用 rpg(action=\"promptUserActions\")，参数："),
+    ("Call the 'progressStory' tool with these parameters:",
+     "调用 rpg(action=\"progressStory\")，参数："),
+    ("Call the 'selectAction' tool with these parameters:",
+     "调用 rpg(action=\"selectAction\")，参数："),
+    ("Call the 'updateGame' tool with these parameters:",
+     "调用 rpg(action=\"updateGame\")，参数："),
+    ("Call the 'createGame' tool with these parameters:",
+     "调用 rpg(action=\"createGame\")，参数："),
+    ("Call the 'getGame' tool with these parameters:",
+     "调用 rpg(action=\"getGame\")，参数："),
+    ("Call the 'selectRestart' tool with these parameters:",
+     "调用 rpg(action=\"selectRestart\")，参数："),
+    ("Completed Successfully", "执行成功"),
+    ("Reason:", "原因："),
+    ("💡 Workflow:", "💡 流程："),
+    ("WAITING FOR USER", "等玩家输入"),
+    ("Restart Flow:", "重开流程："),
+    ("Initialized game world with provided state including characters, world settings, and inventory.",
+     "已按给定初始状态建好局（含角色、世界设定、道具）。"),
+    ("Narrative advanced. Current situation:", "剧情已推进。当前处境："),
+    ("Retrieved complete game state for inspection.", "已读取完整局面。"),
+    ("Player's choice recorded. Selection:", "已记录玩家选择："),
+    ("Game state modified. Changes:", "局面已修改。变更："),
+    ("Interactive UI generated with story progress and", "已生成"),
+    ("action buttons. Options mix positive and negative outcomes for dynamic gameplay. Player can now make a selection.",
+     "个可选项，等玩家选择。"),
+    ("Waiting for user input. No action required until player makes a selection.",
+     "等待玩家输入；玩家选择之前不要再调工具。"),
+    ("Current status: Ready for progression", "当前状态：可以继续推进"),
+    ("in response to situation:", "对应处境："),
+    ("Character: decreased by", "角色：减少"),
+    ("Character: increased by", "角色：增加"),
+    (" entries", " 条"),
+    ("Begin the narrative by describing the opening scene and establishing story context",
+     "先用 progressStory 描述开场情景，把剧情背景立起来"),
+    ("Present player with 2-4 choices that mix positive and negative outcomes for dynamic gameplay",
+     "给玩家 2~4 个有正负取舍的选项"),
+    ("Narrate the consequences and outcomes of this state change in the story",
+     "把这次状态变化造成的后果叙述出来"),
+    ("Apply the consequences of the selected action", "把玩家这次选择的后果写进局面"),
+    ("Create a fresh game with new initial state for the player", "为玩家开一局新的"),
+    ("Begin or advance the narrative", "推进剧情"),
+    ("Inspection mode - use retrieved state to determine next action",
+     "查看模式：根据读到的局面决定下一步"),
+    ("Design a new world and starting situation", "设计新的世界与开场处境"),
+    ("Create new characters (can reference previous if helpful)", "新角色数组（可参考上一局）"),
+    ("Game ended at", "本局结束时间"),
+    ("Last updated:", "- 更新时间:"),
+    ("Updated field:", "- 已修改字段:"),
+    ("change(s) will be displayed to player on next promptUserActions",
+     "条变化会在下次摆选项时展示给玩家"),
+    ("pending change(s) will be displayed in the next UI", "条待显示变化会在下次摆选项时展示"),
+    ("Describe the opening situation, setting, and initial scenario for the player",
+     "描述开场情景（1~3 句中文）"),
+    ("Describe the current situation and setting", "描述当前处境"),
+    ("Describe how the change to", "描述这次变化"),
+    ("affects the game world, characters, and situation", "对局面与角色的影响"),
+    ("Determine which game state field to modify (e.g., characters[0].hp, world.location, inventory)",
+     "字段路径，如 characters[0].hp / world.location / inventory"),
+    ("Calculate new value based on the action outcome and current game state",
+     "根据后果算出的新值"),
+    ("Suggest a new adventure based on the previous game experience", "新一局的标题（可延续上一局风格）"),
+    ("Create new characters (can reference previous game)", "新角色数组"),
+    ("Create 2-4 meaningful options that:", "你自己拟 2~4 个行动选项，要求："),
+    ("- MIX positive AND negative outcomes (risk/reward tradeoffs)", "正负结果混合，有取舍"),
+    ("- Offer both cautious AND daring approaches", "有稳妥的也有冒险的"),
+    ("- Include favorable and unfavorable possibilities", "好结果坏结果都要有"),
+    ("- React to the current situation", "贴合当前处境"),
+    ("- Align with character abilities and game state", "符合角色能力与局面"),
+    ("Not started", "尚未开始"),
+    ("N/A", "无"),
+]
+
+# 上游报错 JSON 的中文化
+_ERROR_MAP = [
+    (r"Game with id (\S+) not found",
+     r"局面 \1 不存在（服务重启过，内存里的局已经丢了）—— 请用 createGame 重开一局"),
+    (r"gameId and options parameters are required", "缺少 gameId 与 options 参数"),
+    (r"gameId, selectedOption, and selectedIndex parameters are required",
+     "缺少 gameId / selectedOption / selectedIndex 参数"),
+    (r"No current situation available for selection", "还没有当前处境可选 —— 先 progressStory 再 promptUserActions"),
+    (r"gameId .* is required", "缺少 gameId 参数"),
+]
+
+
+def localize_text(text: str) -> str:
+    """把上游英文样板转中文，并把工具名指引改成合并后的调用式。"""
+    if not text or not isinstance(text, str):
+        return text
+    # 报错 JSON：整段替换成中文一句话
+    st = text.strip()
+    if st.startswith("{") and '"error"' in st:
+        try:
+            j = json.loads(st)
+            msg = j.get("error") or ""
+            tool = j.get("tool") or ""
+            for pat, rep in _ERROR_MAP:
+                if re.search(pat, msg):
+                    msg = re.sub(pat, rep, msg)
+                    break
+            return "❌ 调用失败（action=%s）：%s" % (tool, msg)
+        except Exception:
+            pass
+    lines = text.split("\n")
+    out = []
+    for line in lines:
+        s = line.strip()
+        if s in _LINE_MAP:
+            out.append(_LINE_MAP[s])
+            continue
+        for a, b in _LABEL_MAP:
+            if s.startswith(a):
+                line = line.replace(a, b, 1)
+                break
+        for a, b in _PHRASE_MAP:
+            if a in line:
+                line = line.replace(a, b)
+        line = re.sub(r"✅ (\w+) Completed Successfully", r"✅ \1 执行成功", line)
+        # 「X: changed from A to B」逐类处理。★不要用全局 " to " 替换 —— 会把
+        # "React to the current situation" 这类正常句子改成 "React 变为 ..."（实测踩过）
+        _who = {"Character": "角色", "World": "世界", "Inventory": "道具",
+                "Item": "道具", "Relationship": "关系"}
+        line = re.sub(
+            r"\b(Character|World|Inventory|Item|Relationship):? changed from (.*?) to (.*)$",
+            lambda m: "%s：从 %s 变为 %s" % (_who[m.group(1)], m.group(2).strip(), m.group(3).strip()),
+            line)
+        # 行尾的 None / Pending 单独处理（其它行也可能带这些值）
+        line = re.sub(r":\s*None\s*$", "：无", line)
+        line = re.sub(r":\s*Pending\s*$", "：等玩家选", line)
+        line = re.sub(r"^(\s*)- (\d+) change\(s\)", r"\1- \2 条变化", line)
+        line = re.sub(r"^(\s*)- Previous game had (\d+) story decisions",
+                      r"\1- 上一局有 \2 次剧情决策", line)
+        line = re.sub(r"\[(\d+)\] 条变化会在", r"[\1] 条变化会在", line)
+        out.append(line)
+    txt = "\n".join(out)
+    # 兜底：万一上游改了文案，至少别让模型看到已不存在的工具名
+    txt = re.sub(r"Call the '(\w+)' tool", lambda m: '调用 rpg(action="%s")' % m.group(1), txt)
+    return txt
+
+
+def localize_response(response):
+    """就地本地化 tools/call 响应里所有 text 内容。"""
+    result = response.get("result")
+    if not isinstance(result, dict):
+        return response
+    items = result.get("content")
+    if not isinstance(items, list):
+        return response
+    new_items = []
+    for it in items:
+        if isinstance(it, dict) and it.get("type") == "text" and isinstance(it.get("text"), str):
+            ni = dict(it)
+            ni["text"] = localize_text(it["text"])
+            new_items.append(ni)
+        else:
+            new_items.append(it)
+    new = dict(response)
+    new["result"] = dict(result)
+    new["result"]["content"] = new_items
+    return new
+
+
 def rewrite_call_result(name, arguments, response):
     """把 tools/call 的响应改成对话友好形态。返回新 response。"""
     result = response.get("result")
@@ -328,13 +570,14 @@ def rewrite_call_result(name, arguments, response):
     if name == "selectRestart":
         real = DS.choice_count(game_id)
         new_items.append({"type": "text", "text":
-                          "【网关校正】本局玩家真实选择次数：%d（上游报的 Total decisions made 读的是 "
-                          "gameHistory，实际存在 _gameHistory，所以恒为 0）。" % real})
+                          "【网关校正】本局玩家真实选择次数：%d（上游报的「累计决策次数」读错了字段，"
+                          "恒为 0，这个数字是网关自己数的）。" % real})
 
     new = dict(response)
     new["result"] = dict(result)
     new["result"]["content"] = new_items
-    return new
+    # 最后统一本地化（上游样板是英文，且指引里写的是已不存在的工具名）
+    return localize_response(new)
 
 
 # --------------------------------------------------------------------------
