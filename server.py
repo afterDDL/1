@@ -683,10 +683,12 @@ MERGED_HINT = {
 RPG_TOOL_SCHEMA = {
     "type": "object",
     "properties": {
-        "action": {"type": "string",
-                   "description": "要执行的操作，取值：createGame（开新局）/ getGame（读局面）/ "
-                                  "progressStory（推进剧情）/ promptUserActions（生成可选行动）/ "
-                                  "selectAction（玩家选定行动）/ updateGame（修改局面字段）/ selectRestart（重开）"},
+        "op": {"type": "string",
+               "enum": ["createGame", "getGame", "progressStory", "promptUserActions",
+                        "selectAction", "updateGame", "selectRestart"],
+               "description": "要执行的操作（必填），取值：createGame（开新局）/ getGame（读局面）/ "
+                              "progressStory（推进剧情）/ promptUserActions（生成可选行动）/ "
+                              "selectAction（玩家选定行动）/ updateGame（修改局面字段）/ selectRestart（重开）"},
         "gameId": {"type": "string",
                    "description": "局面 ID。除 createGame 外都需要，就是上一步返回的那个 id，原样回传不要改动"},
         "initialStateInJson": {"type": "string",
@@ -706,14 +708,15 @@ RPG_TOOL_SCHEMA = {
         "fieldSelector": {"type": "string", "description": "仅 updateGame：要修改的字段路径，如 characters[0].hp"},
         "value": {"type": "string", "description": "仅 updateGame：新值（数字/字符串/对象都写这里）"},
     },
-    "required": ["action"],
+    "required": ["op"],
 }
 
 RPG_TOOL_DESC = (
     "文字跑团引擎，规则判定全在服务端（骰子、战斗、物品、关系、局面持久化），你负责叙事与拟选项。"
-    "用 action 选择操作：createGame 开新局 → progressStory 推进剧情 → "
-    "promptUserActions（你拟 2~4 个选项放进 options）→ 等玩家选 → selectAction 提交玩家的选择 → "
-    "updateGame 施加后果 → 再 progressStory 推进。getGame 复读局面，selectRestart 重开。"
+    "调用时必须给 op 参数，op 取值：createGame（开新局）/ progressStory（推进剧情）/ "
+    "promptUserActions（你拟 2~4 个选项放进 options）/ selectAction（提交玩家的选择）/ "
+    "updateGame（施加后果）/ getGame（复读局面）/ selectRestart（重开）。"
+    "一轮流程：createGame → progressStory → promptUserActions → 等玩家选 → selectAction → updateGame → 再 progressStory。"
     "三个要点：① 每一步都要把上一步返回的 gameId 原样回传，否则局面会丢；"
     "② 摆给玩家的选项就用你传给 promptUserActions 的原文，不要下次改写；"
     "③ 玩家用生活语言回答（如「第2个」）时，把序号或原文放进 selectedOption 即可。"
@@ -735,11 +738,19 @@ def merge_tools_list(resp):
 
 
 def dispatch_merged(arguments):
-    """拆解合并工具入参 → (上游工具名, 上游入参)；不合法时返回 (None, None, 中文错误)。"""
+    """拆解合并工具入参 → (上游工具名, 上游入参)；不合法时返回 (None, None, 中文错误)。
+
+    ★ 分派参数叫 `op`，不叫 `action`：平台的工具调用协议本身就是
+      `action: <工具名>` + `params: {...}`，参数再叫 action 会撞名 ——
+      实测模型会把工具名写进 action 槽、然后在 params 里丢掉这个参数，调用直接失效。
+      （历史兼容：仍接受 action 作为别名。）
+    """
     args = dict(arguments or {})
-    action = args.pop("action", None)
+    action = args.pop("op", None)
+    if action is None:
+        action = args.pop("action", None)
     if not isinstance(action, str) or action not in MERGED_ACTIONS:
-        return None, None, ("action 必须是以下之一：%s。当前收到：%r"
+        return None, None, ("op 必须是以下之一：%s。当前收到：%r"
                             % (" / ".join(MERGED_ACTIONS), action))
     keep = {}
     for k, v in args.items():
@@ -750,7 +761,7 @@ def dispatch_merged(arguments):
     if action == "selectAction" and not ("selectedOption" in keep or "selectedIndex" in keep):
         missing.append("selectedOption（或 selectedIndex）")
     if missing:
-        return None, None, ("action=%s 缺少必填参数：%s。%s"
+        return None, None, ("op=%s 缺少必填参数：%s。%s"
                             % (action, "、".join(missing), MERGED_HINT.get(action, "")))
     return action, keep, None
 

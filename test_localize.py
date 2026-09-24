@@ -101,8 +101,11 @@ for k, v in data.items():
 
 pua = gw.localize_text(data["promptUserActions"]["text"])
 ck("中文选项块原样保留（没被二次翻译）", "【界面已转为文字】" in pua and "请玩家回复序号" in pua)
+# 选项块的模板要直接测生成函数：fixture 里存的是「旧模板」的快照，测它证明不了新模板
+blk = gw._plain_choices_block("gid-1", "场景", [], ["选项甲", "选项乙"])
 ck("选项块不再教模型算 selectedIndex（网关自己会算）",
-   "selectedIndex = 序号-1" not in pua, pua[-260:])
+   "selectedIndex = 序号-1" not in blk and 'rpg(action="selectAction")' in blk, blk[-200:])
+ck("选项块给玩家的编号是 1 基", "1) 选项甲" in blk and "2) 选项乙" in blk)
 ck("选项清单标签与内容相符", "- 选项清单:" in pua or "[0]" not in pua)
 ck("等待玩家输入已中文化", "等待玩家输入" in pua)
 

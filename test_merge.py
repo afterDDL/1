@@ -35,7 +35,13 @@ ck("工具数 = 1", len(tools) == 1, "got %d" % len(tools))
 ck("工具名 = rpg", tools[0]["name"] == "rpg", tools[0]["name"])
 props = tools[0]["inputSchema"]["properties"]
 ck("参数 9 个", len(props) == 9, "got %d: %s" % (len(props), list(props)))
-ck("required = ['action']", tools[0]["inputSchema"]["required"] == ["action"])
+ck("required = ['op']", tools[0]["inputSchema"]["required"] == ["op"])
+ck("★ schema 里不再有叫 action 的参数（与平台协议 action: <工具名> 撞名会失效）",
+   "action" not in props)
+ck("op 带 enum 限定取值",
+   props.get("op", {}).get("enum") == ["createGame", "getGame", "progressStory",
+                                       "promptUserActions", "selectAction", "updateGame",
+                                       "selectRestart"], props.get("op", {}).get("enum"))
 ck("每个参数都有 description", all(p.get("description") for p in props.values()),
    [k for k, v in props.items() if not v.get("description")])
 ck("type 全是单个字符串（无联合数组）",
@@ -57,7 +63,13 @@ a, kept, err = gw.dispatch_merged({"action": "selectAction", "gameId": "abc", "s
 ck("selectAction 只给序号也通过", err is None and kept.get("selectedIndex") == 1, err)
 
 print("=== 3. dispatch：模型常见坏输入 ===")
-a, kept, err = gw.dispatch_merged({"action": "progressStory", "gameId": "abc", "progress": ""})
+a, kept, err = gw.dispatch_merged({"action": "getGame", "gameId": "abc"})
+ck("旧名 action 仍作为别名可用（向后兼容）", err is None and a == "getGame", err)
+
+a, kept, err = gw.dispatch_merged({"op": "getGame", "gameId": "abc"})
+ck("新名 op 正常", err is None and a == "getGame" and kept == {"gameId": "abc"}, (a, kept, err))
+
+a, kept, err = gw.dispatch_merged({"op": "progressStory", "gameId": "x", "progress": "", "options": ""})
 ck("空串参数被剔除并报缺必填", err is not None and "progress" in err, err)
 
 a, kept, err = gw.dispatch_merged({"action": "getGame"})
