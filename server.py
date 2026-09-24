@@ -1,0 +1,512 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+rpg-mcp-server 对话式适配网关 (dialogue gateway)
+================================================
+
+做两件事，且只做这两件事：
+
+1. 传输层：把 `npx -y rpg-mcp-server` 这个 stdio MCP 服务器包成一个公网
+   streamable_http MCP 端点（POST /mcp），不开子进程池、不做持久化，
+   所有 HTTP 请求共用同一个 rpg-mcp-server 子进程（它的状态本来就只活在
+   这一个进程的内存里，多进程反而会互相看不到局面）。
+
+2. 交互层：原服务是给「有 UI 的客户端」写的 ——
+   - promptUserActions 返回 content[0] 是一大坨 text/html 的 resource
+     （约 7KB 的 <button> 界面），对话式智能体没有渲染位；
+   - 它靠用户在网页上「点击按钮」再 postMessage 回 selectAction；
+   - updateGame(isGameOver) 也塞一坨 game-over 的 HTML。
+   本网关把 resource 类内容剥掉，换成一段纯文本的「场景 + 变化 + 选项清单」，
+   并记住每个 gameId 当前的真实选项列表；随后当智能体调 selectAction 时，
+   允许 selectedOption 传「2」这类序号或选项前缀，网关按记忆里的原文补全，
+   使「用户用文字回答 → 映射回 selectAction」这条链路在协议层就成立。
+
+不改变工具个数、不改变工具名、不改变输入 schema —— 平台侧看到的仍然是那 7 个工具。
+
+环境变量：
+  RPG_SERVER_CMD  上游 stdio 命令，默认 "npx -y rpg-mcp-server"
+  PORT            监听端口，默认 8000
+  MCP_PATH        HTTP 路径，默认 /mcp
+  RPG_DEBUG       置 1 打印每次转发的收发日志到 stderr
+仅用 Python 标准库（目标机无 pip / PEP668，避免任何三方依赖）。
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import sys
+import threading
+import time
+import uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+DEBUG = os.environ.get("RPG_DEBUG") == "1"
+PORT = int(os.environ.get("PORT", "8000"))
+MCP_PATH = os.environ.get("MCP_PATH", "/mcp")
+SERVER_CMD = os.environ.get("RPG_SERVER_CMD", "npx -y rpg-mcp-server")
+REQ_TIMEOUT = float(os.environ.get("RPG_REQ_TIMEOUT", "90"))
+# 响应形态：json（默认，最省事）或 sse（把同一个响应包成 text/event-stream 单帧）。
+# 有的平台只认 SSE，两种都支持就不用改代码试错。
+RESP_MODE = os.environ.get("RPG_RESPONSE_MODE", "json").lower()
+
+
+def log(*a):
+    print("[gateway]", *a, file=sys.stderr, flush=True)
+
+
+# --------------------------------------------------------------------------
+# 1. stdio 上游进程
+# --------------------------------------------------------------------------
+class Upstream:
+    """长驻一个 rpg-mcp-server 子进程，按 id 匹配响应。"""
+
+    def __init__(self, command: str):
+        self.command = command
+        self.proc = subprocess.Popen(
+            ["/bin/sh", "-c", command],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True, bufsize=1,
+        )
+        self.lock = threading.Lock()
+        self.pending: dict[int, dict] = {}
+        self.cv = threading.Condition()
+        self._rid = 0
+        self._last_init = None
+        threading.Thread(target=self._read_stdout, daemon=True).start()
+        threading.Thread(target=self._read_stderr, daemon=True).start()
+
+    def _read_stdout(self):
+        for line in self.proc.stdout:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                msg = json.loads(line)
+            except Exception:
+                continue
+            mid = msg.get("id")
+            if mid is None:
+                continue
+            with self.cv:
+                self.pending[mid] = msg
+                self.cv.notify_all()
+
+    def _read_stderr(self):
+        for line in self.proc.stderr:
+            if DEBUG:
+                print("[upstream]", line.rstrip(), file=sys.stderr, flush=True)
+
+    def _write(self, obj):
+        with self.lock:
+            self.proc.stdin.write(json.dumps(obj, ensure_ascii=False) + "\n")
+            self.proc.stdin.flush()
+
+    def request(self, method, params=None, timeout=REQ_TIMEOUT):
+        self._rid += 1
+        rid = self._rid
+        msg = {"jsonrpc": "2.0", "id": rid, "method": method}
+        if params is not None:
+            msg["params"] = params
+        self._write(msg)
+        deadline = time.time() + timeout
+        with self.cv:
+            while rid not in self.pending:
+                remain = deadline - time.time()
+                if remain <= 0:
+                    return {"jsonrpc": "2.0", "id": rid,
+                            "error": {"code": -32000, "message": "upstream timeout"}}
+                self.cv.wait(min(remain, 0.5))
+            return self.pending.pop(rid)
+
+    def notify(self, method, params=None):
+        msg = {"jsonrpc": "2.0", "method": method}
+        if params is not None:
+            msg["params"] = params
+        self._write(msg)
+
+    def healthy(self):
+        return self.proc.poll() is None
+
+
+UP = Upstream(SERVER_CMD)
+
+# --------------------------------------------------------------------------
+# 2. 交互层改写：选项记忆 + promptUserActions / selectAction / game over 文本化
+# --------------------------------------------------------------------------
+class DialogueState:
+    """记住每个 gameId 当前真实的选项原文与已发生的选择次数。"""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.options: dict[str, list[str]] = {}
+        self.choices: dict[str, int] = {}
+        self.mapping_hits: dict[str, int] = {}
+
+    def remember_options(self, game_id, options):
+        if not isinstance(options, list) or not options:
+            return
+        with self.lock:
+            self.options[game_id] = [str(o) for o in options]
+
+    def current_options(self, game_id):
+        with self.lock:
+            return list(self.options.get(game_id, []))
+
+    def note_choice(self, game_id):
+        with self.lock:
+            self.choices[game_id] = self.choices.get(game_id, 0) + 1
+            return self.choices[game_id]
+
+    def choice_count(self, game_id):
+        with self.lock:
+            return self.choices.get(game_id, 0)
+
+    def note_hit(self, kind):
+        with self.lock:
+            self.mapping_hits[kind] = self.mapping_hits.get(kind, 0) + 1
+
+    def hits(self):
+        with self.lock:
+            return dict(self.mapping_hits)
+
+
+DS = DialogueState()
+NUM_RE = re.compile(r"(?:^|\D)([1-9]\d?)(?:\D|$)")
+
+
+def _norm(s: str) -> str:
+    return re.sub(r"[\s，。、,.!！?？\"'“”‘’()（）\[\]【】:：;；-]", "", str(s or "")).lower()
+
+
+def resolve_selection(game_id: str, selected_option, selected_index):
+    """把「用户/智能体给的松散输入」映射回 promptUserActions 的选项原文。
+
+    返回 (option_text, index, how)
+      how ∈ exact / index_only / index_from_text / prefix / fuzzy / passthrough
+    """
+    opts = DS.current_options(game_id)
+    if not opts:
+        return (selected_option, selected_index, "passthrough")
+    # 1) 精确匹配
+    if isinstance(selected_option, str):
+        for i, o in enumerate(opts):
+            if o == selected_option:
+                return (o, i, "exact")
+    # 2) 只给了序号
+    idx = None
+    if isinstance(selected_index, bool):
+        idx = None
+    elif isinstance(selected_index, int):
+        idx = selected_index
+    elif isinstance(selected_index, str) and selected_index.strip().isdigit():
+        idx = int(selected_index.strip())
+    if selected_option in (None, "", []) and idx is not None and 0 <= idx < len(opts):
+        return (opts[idx], idx, "index_only")
+    # 3) 从文本里抠出序号（"2" / "第2个" / "选 2"）
+    if isinstance(selected_option, str):
+        s = selected_option.strip()
+        if s.isdigit() and 0 < int(s) <= len(opts):
+            return (opts[int(s) - 1], int(s) - 1, "index_from_text")
+        m = NUM_RE.search(s)
+        if m and len(s) <= 6 and 0 < int(m.group(1)) <= len(opts):
+            n = int(m.group(1))
+            return (opts[n - 1], n - 1, "index_from_text")
+    # 4) 前缀 / 子串 / 归一化模糊匹配
+    if isinstance(selected_option, str) and selected_option.strip():
+        sn = _norm(selected_option)
+        cands = []
+        for i, o in enumerate(opts):
+            on = _norm(o)
+            if on.startswith(sn) or sn.startswith(on[:max(4, len(sn))]):
+                cands.append((i, o))
+        if len(cands) == 1:
+            return (cands[0][1], cands[0][0], "prefix")
+        cands = [(i, o) for i, o in enumerate(opts) if sn and (sn in _norm(o) or _norm(o) in sn)]
+        if len(cands) == 1:
+            return (cands[0][1], cands[0][0], "fuzzy")
+    # 5) 兜底：有合法序号就用序号
+    if idx is not None and 0 <= idx < len(opts):
+        return (opts[idx], idx, "index_only")
+    return (selected_option, selected_index, "passthrough")
+
+
+def _plain_choices_block(game_id, story, deltas, options, note_extra=""):
+    """给对话式智能体的选项文本块（1-based，人读友好，同时给出原文）。"""
+    lines = []
+    lines.append("━" * 34)
+    lines.append("【界面已转为文字】")
+    if story:
+        lines.append("▍当前场景：%s" % story)
+    if deltas:
+        lines.append("▍最近变化：")
+        for d in deltas:
+            lines.append("   ⚡ %s" % d.get("description", d.get("field", "")))
+    lines.append("▍请玩家回复序号选择（回复 1-%d）：" % len(options))
+    for i, o in enumerate(options, 1):
+        lines.append("   %d) %s" % (i, o))
+    lines.append("▍把玩家的回复转成 selectAction 时：selectedIndex = 序号-1，"
+                 "selectedOption 必须用上面括号外的完整原文（网关也接受只给序号）。")
+    lines.append("━" * 34)
+    if note_extra:
+        lines.append(note_extra)
+    return "\n".join(lines)
+
+
+def _plain_gameover_block(game_id, reason):
+    return "\n".join([
+        "━" * 34,
+        "【界面已转为文字】",
+        "☠️ 游戏结束：%s" % (reason or "（服务端未提供原因）"),
+        "▍想再来一局就回复「重开」，智能体将调用 selectRestart 并用新的初始状态 createGame。",
+        "━" * 34,
+    ])
+
+
+def _extract_deltas(html: str):
+    """从被丢弃的 HTML 里把「最近变化」救出来转成文本（唯一的信息来源）。"""
+    out = []
+    for m in re.finditer(r'<div class="delta-item">\s*(.*?)\s*</div>', html or "", re.S):
+        s = re.sub(r"<[^>]+>", "", m.group(1))
+        s = s.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">") \
+             .replace("&quot;", '"').replace("&#39;", "'").strip()
+        s = s.lstrip("⚡ ").strip()
+        if s:
+            out.append({"description": s})
+    return out
+
+
+def rewrite_call_result(name, arguments, response):
+    """把 tools/call 的响应改成对话友好形态。返回新 response。"""
+    result = response.get("result")
+    if not isinstance(result, dict):
+        return response
+    # 先记忆选项（用请求参数，最可靠）
+    game_id = (arguments or {}).get("gameId") or ""
+    if name == "promptUserActions":
+        DS.remember_options(game_id, (arguments or {}).get("options"))
+    # 松散 selectAction 归一化（真的改写了发给上游的参数，见 call_tool 里调用点）
+    items = result.get("content")
+    if not isinstance(items, list):
+        return response
+    text_items = [i for i in items if i.get("type") == "text"]
+    other_items = [i for i in items if i.get("type") not in ("text", "resource")]
+    resource_items = [i for i in items if i.get("type") == "resource"]
+
+    new_items = list(text_items)
+    if resource_items and not result.get("isError"):
+        uri = ""
+        html = ""
+        try:
+            uri = resource_items[0].get("resource", {}).get("uri", "")
+            html = resource_items[0].get("resource", {}).get("text", "") or ""
+        except Exception:
+            uri = ""
+        if name == "promptUserActions":
+            opts = DS.current_options(game_id) or (arguments or {}).get("options") or []
+            story = ""
+            for t in text_items:
+                m = re.search(r'Situation: "(.*?)"', t.get("text", ""), re.S)
+                if m:
+                    story = m.group(1)
+                    break
+            deltas = _extract_deltas(html)
+            new_items.append({"type": "text", "text": _plain_choices_block(
+                game_id, story, deltas, opts)})
+        elif name == "updateGame" and uri.endswith("/game-over"):
+            reason = (arguments or {}).get("gameOverReason", "")
+            new_items.append({"type": "text", "text": _plain_gameover_block(game_id, reason)})
+        else:
+            new_items.append({"type": "text", "text":
+                              "【界面已转为文字】（原响应含 text/html 资源 %s，无渲染位的客户端可忽略）" % uri})
+    new_items.extend(other_items)
+    if not new_items:
+        new_items = [{"type": "text", "text": "（上游返回了空内容）"}]
+
+    # selectRestart 的历史条数上游永远是 0（读错了字段），按网关自己的统计补一行
+    if name == "selectRestart":
+        real = DS.choice_count(game_id)
+        new_items.append({"type": "text", "text":
+                          "【网关校正】本局玩家真实选择次数：%d（上游报的 Total decisions made 读的是 "
+                          "gameHistory，实际存在 _gameHistory，所以恒为 0）。" % real})
+
+    new = dict(response)
+    new["result"] = dict(result)
+    new["result"]["content"] = new_items
+    return new
+
+
+# --------------------------------------------------------------------------
+# 3. 业务分发（HTTP 层与 stdio 过滤层共用同一套逻辑）
+# --------------------------------------------------------------------------
+def process_message(msg):
+    """返回 (http_status, response_obj_or_None)。response 为 None 表示空体（notification）。"""
+    is_notification = "id" not in msg or msg.get("id") is None
+    method = msg.get("method", "")
+    params = msg.get("params") or {}
+    if is_notification:
+        if method in ("notifications/initialized", "notifications/cancelled",
+                      "notifications/progress", "notifications/roots/list_changed"):
+            UP.notify(method, params if params else None)
+        return (202, None)
+    if method == "initialize":
+        return (200, UP.request(method, params))
+    if method == "ping":
+        return (200, {"jsonrpc": "2.0", "id": msg["id"], "result": {}})
+    if method == "tools/list":
+        return (200, UP.request(method, params or {}))
+    if method == "tools/call":
+        name = params.get("name")
+        arguments = params.get("arguments") or {}
+        sent_args = dict(arguments)
+        how = "n/a"
+        if name == "selectAction":
+            opt, idx, how = resolve_selection(arguments.get("gameId", ""),
+                                              arguments.get("selectedOption"),
+                                              arguments.get("selectedIndex"))
+            sent_args["selectedOption"] = opt
+            if isinstance(idx, int):
+                sent_args["selectedIndex"] = idx
+            DS.note_hit("selectAction_rewritten" if sent_args != arguments else "selectAction_exact")
+        resp = UP.request(method, {"name": name, "arguments": sent_args})
+        if name == "selectAction" and not (resp.get("result") or {}).get("isError"):
+            DS.note_choice(arguments.get("gameId", ""))
+        rewritten = rewrite_call_result(name, sent_args, resp)
+        if DEBUG:
+            log("tools/call %s map=%s args=%s" % (
+                name, how, json.dumps(sent_args, ensure_ascii=False)[:200]))
+        return (200, rewritten)
+    if method in ("resources/list", "prompts/list", "completion/complete",
+                  "resources/templates/list", "logging/setLevel"):
+        return (200, {"jsonrpc": "2.0", "id": msg["id"],
+                      "error": {"code": -32601, "message": "method not found: %s" % method}})
+    return (200, UP.request(method, params))
+
+
+# --------------------------------------------------------------------------
+# 4. HTTP 层：streamable_http
+# --------------------------------------------------------------------------
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    server_version = "rpg-dialogue-gateway/1.0"
+
+    # ---- 工具 ----
+    def _send(self, code, body: bytes, ctype="application/json", extra=None):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Headers", "*")
+        self.send_header("Access-Control-Expose-Headers", "Mcp-Session-Id")
+        self.send_header("Access-Control-Allow-Methods", "GET,POST,DELETE,OPTIONS")
+        for k, v in (extra or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        if body:
+            self.wfile.write(body)
+
+    def _json(self, code, obj, extra=None):
+        payload = json.dumps(obj, ensure_ascii=False)
+        if RESP_MODE == "sse" and code == 200:
+            body = ("event: message\ndata: %s\n\n" % payload).encode("utf-8")
+            self._send(code, body, "text/event-stream", extra)
+            return
+        self._send(code, payload.encode("utf-8"), "application/json", extra)
+
+    def log_message(self, fmt, *args):
+        if DEBUG:
+            print("[http]", fmt % args, file=sys.stderr, flush=True)
+
+    def _path_ok(self):
+        return self.path.split("?")[0].rstrip("/") in (MCP_PATH.rstrip("/"), "")
+
+    # ---- 方法 ----
+    def do_OPTIONS(self):
+        self._send(204, b"")
+
+    def do_GET(self):
+        p = self.path.split("?")[0]
+        if p in ("/healthz", "/health", "/"):
+            self._send(200, b"rpg-dialogue-gateway ok\n", "text/plain; charset=utf-8")
+            return
+        # 本网关不做服务端推送，按 spec 返回 405
+        self._send(405, b'{"error":"GET not supported (no server-initiated SSE)"}',
+                   "application/json")
+
+    def do_DELETE(self):
+        self._send(200, b'{"ok":true}', "application/json")
+
+    def do_POST(self):
+        if not self._path_ok():
+            self._json(404, {"error": "unknown path %s" % self.path})
+            return
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            n = 0
+        raw = self.rfile.read(n) if n else b""
+        try:
+            msg = json.loads(raw.decode("utf-8"))
+        except Exception:
+            self._json(400, {"jsonrpc": "2.0", "id": None,
+                             "error": {"code": -32700, "message": "parse error"}})
+            return
+
+        is_notification = "id" not in msg or msg.get("id") is None
+        method = msg.get("method", "")
+        extra = {}
+        if method == "initialize":
+            # 签发会话 id；不强制校验，方便平台用任意 header 复用同一实例
+            extra["Mcp-Session-Id"] = uuid.uuid4().hex
+        status, resp = process_message(msg)
+        if resp is None:
+            self._send(status, b"")
+            return
+        self._json(status, resp, extra)
+
+
+def run_stdio_shim():
+    """stdio -> stdio 过滤层：给「用 supergateway 桥接」的部署用。
+    读 stdin 行分隔 JSON-RPC，转发给上游并把响应改写后写回 stdout。
+    这样 supergateway 只负责传输，对话化改写仍由本文件完成。"""
+    log("stdio-shim 模式启动，上游命令：%s" % SERVER_CMD)
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            msg = json.loads(line)
+        except Exception:
+            continue
+        try:
+            status, resp = process_message(msg)
+        except Exception as e:  # 任何异常都要变成 JSON-RPC 错误，不能吞掉
+            if "id" in msg and msg["id"] is not None:
+                sys.stdout.write(json.dumps(
+                    {"jsonrpc": "2.0", "id": msg["id"],
+                     "error": {"code": -32603, "message": "gateway error: %s" % e}},
+                    ensure_ascii=False) + "\n")
+                sys.stdout.flush()
+            continue
+        if resp is None:
+            continue
+        sys.stdout.write(json.dumps(resp, ensure_ascii=False) + "\n")
+        sys.stdout.flush()
+
+
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] in ("stdio-shim", "stdio", "shim"):
+        run_stdio_shim()
+        return
+    if not UP.healthy():
+        log("上游进程未起来，命令：%s" % SERVER_CMD)
+    log("上游命令: %s" % SERVER_CMD)
+    log("监听 0.0.0.0:%d  path=%s" % (PORT, MCP_PATH))
+    srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    srv.daemon_threads = True
+    srv.serve_forever()
+
+
+if __name__ == "__main__":
+    main()

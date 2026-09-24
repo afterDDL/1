@@ -1,0 +1,25 @@
+# 公网 streamable_http 部署配置（Render Blueprint）
+#
+# 重要：本服务**必须单实例**。
+# rpg-mcp-server 的全部局面存在进程内存里（GameManager.games = new Map()），
+# 多副本水平扩展会导致「玩家在 A 副本建局、下一句请求落到 B 副本 → not found」。
+# 所以 scale/instances 固定为 1，不要开 autoscaling。
+services:
+  - type: web
+    name: rpg-mcp-gateway
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    plan: free            # 免费档会在 ~15 分钟无流量后休眠，醒来即冷启动 → 内存局面丢失，见报告
+    region: singapore
+    healthCheckPath: /healthz
+    # 不要加 autoscaling / 不要多副本：必须 1 个实例
+    envVars:
+      - key: MCP_PATH
+        value: /mcp
+      - key: RPG_SERVER_CMD
+        value: /usr/local/bin/rpg-mcp-server
+      - key: RPG_REQ_TIMEOUT
+        value: "90"
+      - key: RPG_DEBUG
+        value: "0"
