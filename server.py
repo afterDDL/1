@@ -338,6 +338,72 @@ def rewrite_call_result(name, arguments, response):
 
 
 # --------------------------------------------------------------------------
+# 2.5 schema 规范化：百工平台只接受 JSON Schema 的保守子集
+#
+# 实测结论（对比平台【已成功导入】的另一个 MCP）：
+#   - schema 顶层有 "title"      → 平台接受
+#   - 属性里有 "anyOf"           → 平台接受
+#   - 属性缺 "description"       → 平台接受
+#   - 属性 "type" 写成【联合类型数组】（如 ["string","number","object",...]）
+#                                → 平台导入失败：建插件返回 502002 获取数据失败
+# 所以这里统一把 type 收敛成单个字符串，并去掉 examples 这类非标准键。
+# 选择 string 作为主类型同时也是百工约定：平台把 object/array 参数以 JSON 字符串注入。
+# --------------------------------------------------------------------------
+_PRIMARY_TYPE = ("string", "object", "array", "number", "integer", "boolean", "null")
+
+
+def clean_prop(p):
+    """把属性 schema 规范化成保守形状。"""
+    if not isinstance(p, dict):
+        return p
+    out = dict(p)
+    out.pop("examples", None)
+    t = out.get("type")
+    if isinstance(t, list):
+        chosen = next((c for c in _PRIMARY_TYPE if c in t), None)
+        if chosen:
+            out["type"] = chosen
+        else:
+            out.pop("type", None)
+        others = [x for x in t if x != chosen]
+        if others:
+            note = "（此参数也可为 %s）" % "/".join(others)
+            if note not in (out.get("description") or ""):
+                out["description"] = (out.get("description") or "") + note
+    return out
+
+
+def sanitize_tools_list(resp):
+    """重写 tools/list 响应，把每个工具的入参 schema 收敛成平台可接受的形状。"""
+    if not isinstance(resp, dict):
+        return resp
+    result = resp.get("result")
+    if not isinstance(result, dict):
+        return resp
+    tools = result.get("tools")
+    if not isinstance(tools, list):
+        return resp
+    new_tools = []
+    for t in tools:
+        if not isinstance(t, dict):
+            new_tools.append(t)
+            continue
+        nt = dict(t)
+        sch = nt.get("inputSchema")
+        if isinstance(sch, dict):
+            ns = dict(sch)
+            props = ns.get("properties")
+            if isinstance(props, dict):
+                ns["properties"] = {k: clean_prop(v) for k, v in props.items()}
+            nt["inputSchema"] = ns
+        new_tools.append(nt)
+    out = dict(resp)
+    out["result"] = dict(result)
+    out["result"]["tools"] = new_tools
+    return out
+
+
+# --------------------------------------------------------------------------
 # 3. 业务分发（HTTP 层与 stdio 过滤层共用同一套逻辑）
 # --------------------------------------------------------------------------
 def process_message(msg):
@@ -355,7 +421,8 @@ def process_message(msg):
     if method == "ping":
         return (200, {"jsonrpc": "2.0", "id": msg["id"], "result": {}})
     if method == "tools/list":
-        return (200, UP.request(method, params or {}))
+        # schema 必须收敛成平台可接受的保守形状，否则建插件会 502002
+        return (200, sanitize_tools_list(UP.request(method, params or {})))
     if method == "tools/call":
         name = params.get("name")
         arguments = params.get("arguments") or {}
@@ -369,6 +436,14 @@ def process_message(msg):
             if isinstance(idx, int):
                 sent_args["selectedIndex"] = idx
             DS.note_hit("selectAction_rewritten" if sent_args != arguments else "selectAction_exact")
+        # 参数还原：schema 里我们把 value / initialStateInJson 声明为 string
+        # （百工约定会把 object/array 以 JSON 字符串注入），这里还原成真实类型再给上游。
+        for _k in ("value", "initialStateInJson"):
+            if _k in sent_args and isinstance(sent_args[_k], str):
+                try:
+                    sent_args[_k] = json.loads(sent_args[_k])
+                except Exception:
+                    pass  # 不是合法 JSON 就按普通字符串用
         resp = UP.request(method, {"name": name, "arguments": sent_args})
         if name == "selectAction" and not (resp.get("result") or {}).get("isError"):
             DS.note_choice(arguments.get("gameId", ""))
