@@ -462,6 +462,31 @@ def process_message(msg):
 # --------------------------------------------------------------------------
 # 4. HTTP 层：streamable_http
 # --------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+# 请求记录（诊断用：看清平台握手时到底发了什么、断在哪一步）
+# GET /__debug/requests 可读回最近 40 条
+# --------------------------------------------------------------------------
+REQ_LOG = []
+_REQ_LOCK = threading.Lock()
+
+
+def record_req(kind, path, headers, body):
+    try:
+        with _REQ_LOCK:
+            REQ_LOG.append({
+                "t": time.strftime("%H:%M:%S"),
+                "kind": kind,
+                "path": path,
+                "headers": {k: v for k, v in headers.items()
+                            if k.lower() in ("content-type", "accept", "mcp-session-id",
+                                             "user-agent", "origin", "content-length")},
+                "body": (body or "")[:700],
+            })
+            del REQ_LOG[:-40]
+    except Exception:
+        pass
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "rpg-dialogue-gateway/1.0"
@@ -502,6 +527,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         p = self.path.split("?")[0]
+        if p in ("/__debug/requests", "/_dbg"):
+            self._json(200, {"count": len(REQ_LOG), "requests": REQ_LOG})
+            return
         if p in ("/healthz", "/health", "/"):
             self._send(200, b"rpg-dialogue-gateway ok\n", "text/plain; charset=utf-8")
             return
@@ -521,6 +549,7 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             n = 0
         raw = self.rfile.read(n) if n else b""
+        record_req("POST", self.path, self.headers, raw.decode("utf-8", "replace"))
         try:
             msg = json.loads(raw.decode("utf-8"))
         except Exception:
