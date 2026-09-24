@@ -21,7 +21,7 @@ rpg-mcp-server 对话式适配网关 (dialogue gateway)
    允许 selectedOption 传「2」这类序号或选项前缀，网关按记忆里的原文补全，
    使「用户用文字回答 → 映射回 selectAction」这条链路在协议层就成立。
 
-不改变工具个数、不改变工具名、不改变输入 schema —— 平台侧看到的仍然是那 7 个工具。
+对外只暴露 1 个工具 `rpg`（action 分派到上游那 7 个），描述与参数都已中文化。
 
 环境变量：
   RPG_SERVER_CMD  上游 stdio 命令，默认 "npx -y rpg-mcp-server"
@@ -404,6 +404,105 @@ def sanitize_tools_list(resp):
 
 
 # --------------------------------------------------------------------------
+# 2.6 工具合并：7 个 MCP 工具 → 1 个 action 分派工具
+#
+# 为什么：平台给智能体的工具预算有限，7 个工具会挤占模型的选择准确率。
+# 对外只暴露 1 个 `rpg`，内部按 action 路由到原上游工具；旧工具名仍接受，
+# 已建好的插件不会因此失效。
+# --------------------------------------------------------------------------
+MERGED_NAME = "rpg"
+MERGED_ACTIONS = ["createGame", "getGame", "progressStory", "promptUserActions",
+                  "selectAction", "updateGame", "selectRestart"]
+MERGED_PARAMS = ("gameId", "initialStateInJson", "progress", "selectedOption",
+                 "selectedIndex", "fieldSelector", "value", "restart", "restartReason")
+MERGED_REQUIRED = {
+    "createGame": ["initialStateInJson"],
+    "getGame": ["gameId"],
+    "progressStory": ["gameId", "progress"],
+    "promptUserActions": ["gameId"],
+    "selectAction": ["gameId"],  # 另需 selectedOption 或 selectedIndex 之一
+    "updateGame": ["gameId", "fieldSelector", "value"],
+    "selectRestart": ["gameId"],
+}
+MERGED_HINT = {
+    "createGame": "initialStateInJson 传初始局面 JSON，如 {'title':'失落的遗迹','characters':[{'name':'冒险者','level':1,'hp':100,'mp':50,'strength':10,'agility':9,'intelligence':8}],'world':{'location':'新手村','time':'清晨','weather':'晴朗'}}",
+    "getGame": "gameId 就是 createGame 返回的那个 id",
+    "progressStory": "progress 是这一段要推进的剧情叙述",
+    "promptUserActions": "gameId 就是上一步那个 id",
+    "selectAction": "selectedOption 给玩家选的行动，序号（如「2」）或选项原文都行",
+    "updateGame": "fieldSelector 是字段路径如 characters[0].hp，value 是新值",
+    "selectRestart": "gameId 就是上一步那个 id",
+}
+
+RPG_TOOL_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "action": {"type": "string",
+                   "description": "要执行的操作，取值：createGame（开新局）/ getGame（读局面）/ "
+                                  "progressStory（推进剧情）/ promptUserActions（生成可选行动）/ "
+                                  "selectAction（玩家选定行动）/ updateGame（修改局面字段）/ selectRestart（重开）"},
+        "gameId": {"type": "string",
+                   "description": "局面 ID。除 createGame 外都需要，就是上一步返回的那个 id，原样回传不要改动"},
+        "initialStateInJson": {"type": "string",
+                               "description": "仅 createGame：初始局面 JSON。含 title（局名）、"
+                                              "characters（角色数组，每人 name/level/hp/mp/strength/agility/intelligence）、"
+                                              "world（location/time/weather）"},
+        "progress": {"type": "string", "description": "仅 progressStory：这一段要推进的剧情叙述"},
+        "selectedOption": {"type": "string",
+                           "description": "仅 selectAction：玩家选定的行动。可直接给序号（如「2」「第2个」）或选项原文"},
+        "selectedIndex": {"type": "integer",
+                          "description": "仅 selectAction：选项序号，可省略；给了也会被校正成真实序号"},
+        "fieldSelector": {"type": "string", "description": "仅 updateGame：要修改的字段路径，如 characters[0].hp"},
+        "value": {"type": "string", "description": "仅 updateGame：新值（数字/字符串/对象都写这里）"},
+    },
+    "required": ["action"],
+}
+
+RPG_TOOL_DESC = (
+    "文字跑团引擎，规则判定全在服务端（骰子、战斗、物品、关系、局面持久化），你只负责叙事。"
+    "用 action 选择操作：createGame 开新局 → progressStory 推进剧情 → promptUserActions 拿可选行动 → "
+    "selectAction 提交玩家选择 → getGame 复读局面；updateGame 改字段，selectRestart 重开。"
+    "两个要点：① 每一步都要把上一步返回的 gameId 原样回传，否则局面会丢；"
+    "② 把选项摆给玩家时，用 promptUserActions 返回的原文，不要自己编造。"
+)
+
+
+def merge_tools_list(resp):
+    """把上游那 7 个工具替换成 1 个 action 分派工具（描述与参数均中文化）。"""
+    if not isinstance(resp, dict) or not isinstance(resp.get("result"), dict):
+        return resp
+    out = dict(resp)
+    out["result"] = dict(resp["result"])
+    out["result"]["tools"] = [{
+        "name": MERGED_NAME,
+        "description": RPG_TOOL_DESC,
+        "inputSchema": RPG_TOOL_SCHEMA,
+    }]
+    return out
+
+
+def dispatch_merged(arguments):
+    """拆解合并工具入参 → (上游工具名, 上游入参)；不合法时返回 (None, None, 中文错误)。"""
+    args = dict(arguments or {})
+    action = args.pop("action", None)
+    if not isinstance(action, str) or action not in MERGED_ACTIONS:
+        return None, None, ("action 必须是以下之一：%s。当前收到：%r"
+                            % (" / ".join(MERGED_ACTIONS), action))
+    keep = {}
+    for k, v in args.items():
+        # 只放行已知参数，并丢掉空串 / None（模型常把用不到的参数填空串）
+        if k in MERGED_PARAMS and v is not None and v != "":
+            keep[k] = v
+    missing = [p for p in MERGED_REQUIRED.get(action, []) if p not in keep]
+    if action == "selectAction" and not ("selectedOption" in keep or "selectedIndex" in keep):
+        missing.append("selectedOption（或 selectedIndex）")
+    if missing:
+        return None, None, ("action=%s 缺少必填参数：%s。%s"
+                            % (action, "、".join(missing), MERGED_HINT.get(action, "")))
+    return action, keep, None
+
+
+# --------------------------------------------------------------------------
 # 3. 业务分发（HTTP 层与 stdio 过滤层共用同一套逻辑）
 # --------------------------------------------------------------------------
 def process_message(msg):
@@ -421,11 +520,17 @@ def process_message(msg):
     if method == "ping":
         return (200, {"jsonrpc": "2.0", "id": msg["id"], "result": {}})
     if method == "tools/list":
-        # schema 必须收敛成平台可接受的保守形状，否则建插件会 502002
-        return (200, sanitize_tools_list(UP.request(method, params or {})))
+        # schema 必须收敛成平台可接受的保守形状，否则建插件会 502002；
+        # 然后再合并成单个 action 分派工具。
+        return (200, merge_tools_list(sanitize_tools_list(UP.request(method, params or {}))))
     if method == "tools/call":
         name = params.get("name")
         arguments = params.get("arguments") or {}
+        if name == MERGED_NAME:
+            name, arguments, err = dispatch_merged(arguments)
+            if err:
+                return (200, {"jsonrpc": "2.0", "id": msg["id"], "result": {
+                    "content": [{"type": "text", "text": err}], "isError": True}})
         sent_args = dict(arguments)
         how = "n/a"
         if name == "selectAction":
@@ -599,6 +704,25 @@ def run_stdio_shim():
         sys.stdout.flush()
 
 
+def keep_awake():
+    """Render 免费实例闲置约 15 分钟会休眠，冷启动实测 20~60 秒（热态 <1 秒）。
+    每 10 分钟自请求一次 /healthz，让实例保持热态。
+    只在托管环境开启（RENDER / KEEP_AWAKE 环境变量），本地跑不受影响。"""
+    import urllib.request
+    base = (os.environ.get("RENDER_EXTERNAL_URL") or "").rstrip("/")
+    if not base:
+        log("keep-awake: 未设置 RENDER_EXTERNAL_URL，跳过")
+        return
+    target = base + "/healthz"
+    while True:
+        time.sleep(600)
+        try:
+            urllib.request.urlopen(target, timeout=60).read()
+            log("keep-awake ok: %s" % target)
+        except Exception as e:
+            log("keep-awake failed: %s: %s" % (type(e).__name__, e))
+
+
 def main():
     if len(sys.argv) > 1 and sys.argv[1] in ("stdio-shim", "stdio", "shim"):
         run_stdio_shim()
@@ -607,6 +731,10 @@ def main():
         log("上游进程未起来，命令：%s" % SERVER_CMD)
     log("上游命令: %s" % SERVER_CMD)
     log("监听 0.0.0.0:%d  path=%s" % (PORT, MCP_PATH))
+    log("对外工具: %s（action 分派 %d 个上游工具）" % (MERGED_NAME, len(MERGED_ACTIONS)))
+    if os.environ.get("RENDER") or os.environ.get("KEEP_AWAKE"):
+        threading.Thread(target=keep_awake, daemon=True).start()
+        log("keep-awake 线程已启动（每 10 分钟）")
     srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     srv.daemon_threads = True
     srv.serve_forever()
