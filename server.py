@@ -246,8 +246,8 @@ def _plain_choices_block(game_id, story, deltas, options, note_extra=""):
     lines.append("▍请玩家回复序号选择（回复 1-%d）：" % len(options))
     for i, o in enumerate(options, 1):
         lines.append("   %d) %s" % (i, o))
-    lines.append("▍把玩家的回复转成 selectAction 时：selectedIndex = 序号-1，"
-                 "selectedOption 必须用上面括号外的完整原文（网关也接受只给序号）。")
+    lines.append("▍把这个回复转给工具：调用 rpg(action=\"selectAction\")，"
+                 "selectedOption 用上面括号外的完整原文（玩家只回序号也行，网关会自己换算）。")
     lines.append("━" * 34)
     if note_extra:
         lines.append(note_extra)
@@ -486,6 +486,9 @@ def localize_text(text: str) -> str:
         # 行尾的 None / Pending 单独处理（其它行也可能带这些值）
         line = re.sub(r":\s*None\s*$", "：无", line)
         line = re.sub(r":\s*Pending\s*$", "：等玩家选", line)
+        # 同一行里既报了数量又列了选项的，标签换成「选项清单」才相符
+        if line.startswith("- 已给出选项数:") and "[" in line:
+            line = line.replace("- 已给出选项数:", "- 选项清单:", 1)
         line = re.sub(r"^(\s*)- (\d+) change\(s\)", r"\1- \2 条变化", line)
         line = re.sub(r"^(\s*)- Previous game had (\d+) story decisions",
                       r"\1- 上一局有 \2 次剧情决策", line)
