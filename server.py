@@ -413,13 +413,13 @@ def sanitize_tools_list(resp):
 MERGED_NAME = "rpg"
 MERGED_ACTIONS = ["createGame", "getGame", "progressStory", "promptUserActions",
                   "selectAction", "updateGame", "selectRestart"]
-MERGED_PARAMS = ("gameId", "initialStateInJson", "progress", "selectedOption",
+MERGED_PARAMS = ("gameId", "initialStateInJson", "progress", "options", "selectedOption",
                  "selectedIndex", "fieldSelector", "value", "restart", "restartReason")
 MERGED_REQUIRED = {
     "createGame": ["initialStateInJson"],
     "getGame": ["gameId"],
     "progressStory": ["gameId", "progress"],
-    "promptUserActions": ["gameId"],
+    "promptUserActions": ["gameId", "options"],
     "selectAction": ["gameId"],  # 另需 selectedOption 或 selectedIndex 之一
     "updateGame": ["gameId", "fieldSelector", "value"],
     "selectRestart": ["gameId"],
@@ -428,7 +428,7 @@ MERGED_HINT = {
     "createGame": "initialStateInJson 传初始局面 JSON，如 {'title':'失落的遗迹','characters':[{'name':'冒险者','level':1,'hp':100,'mp':50,'strength':10,'agility':9,'intelligence':8}],'world':{'location':'新手村','time':'清晨','weather':'晴朗'}}",
     "getGame": "gameId 就是 createGame 返回的那个 id",
     "progressStory": "progress 是这一段要推进的剧情叙述",
-    "promptUserActions": "gameId 就是上一步那个 id",
+    "promptUserActions": "options 是你自己拟的 2~4 个行动选项（字符串数组），要正负结果混合",
     "selectAction": "selectedOption 给玩家选的行动，序号（如「2」）或选项原文都行",
     "updateGame": "fieldSelector 是字段路径如 characters[0].hp，value 是新值",
     "selectRestart": "gameId 就是上一步那个 id",
@@ -448,6 +448,11 @@ RPG_TOOL_SCHEMA = {
                                               "characters（角色数组，每人 name/level/hp/mp/strength/agility/intelligence）、"
                                               "world（location/time/weather）"},
         "progress": {"type": "string", "description": "仅 progressStory：这一段要推进的剧情叙述"},
+        "options": {"type": "array",
+                    "items": {"type": "string"},
+                    "description": "仅 promptUserActions：你自己拟的 2~4 个行动选项。要正负结果混合——"
+                                   "有稳妥的也有冒险的，各选项后果要不同。例：['谨慎上前搭话（可能得情报，也可能被骗）',"
+                                   "'先发制人攻击（有风险但可能一击定胜负）','绕路另找入口（更安全但耗时）']"},
         "selectedOption": {"type": "string",
                            "description": "仅 selectAction：玩家选定的行动。可直接给序号（如「2」「第2个」）或选项原文"},
         "selectedIndex": {"type": "integer",
@@ -459,11 +464,13 @@ RPG_TOOL_SCHEMA = {
 }
 
 RPG_TOOL_DESC = (
-    "文字跑团引擎，规则判定全在服务端（骰子、战斗、物品、关系、局面持久化），你只负责叙事。"
-    "用 action 选择操作：createGame 开新局 → progressStory 推进剧情 → promptUserActions 拿可选行动 → "
-    "selectAction 提交玩家选择 → getGame 复读局面；updateGame 改字段，selectRestart 重开。"
-    "两个要点：① 每一步都要把上一步返回的 gameId 原样回传，否则局面会丢；"
-    "② 把选项摆给玩家时，用 promptUserActions 返回的原文，不要自己编造。"
+    "文字跑团引擎，规则判定全在服务端（骰子、战斗、物品、关系、局面持久化），你负责叙事与拟选项。"
+    "用 action 选择操作：createGame 开新局 → progressStory 推进剧情 → "
+    "promptUserActions（你拟 2~4 个选项放进 options）→ 等玩家选 → selectAction 提交玩家的选择 → "
+    "updateGame 施加后果 → 再 progressStory 推进。getGame 复读局面，selectRestart 重开。"
+    "三个要点：① 每一步都要把上一步返回的 gameId 原样回传，否则局面会丢；"
+    "② 摆给玩家的选项就用你传给 promptUserActions 的原文，不要下次改写；"
+    "③ 玩家用生活语言回答（如「第2个」）时，把序号或原文放进 selectedOption 即可。"
 )
 
 
@@ -500,6 +507,27 @@ def dispatch_merged(arguments):
         return None, None, ("action=%s 缺少必填参数：%s。%s"
                             % (action, "、".join(missing), MERGED_HINT.get(action, "")))
     return action, keep, None
+
+
+def coerce_options(v):
+    """options 必须是字符串数组。模型实际会给：真数组 / JSON 串 / 换行分隔的纯文本，都归一化。"""
+    if isinstance(v, list):
+        return [str(x) for x in v if str(x).strip()]
+    if isinstance(v, str):
+        s = v.strip()
+        if s.startswith("["):
+            try:
+                arr = json.loads(s)
+                if isinstance(arr, list):
+                    return [str(x) for x in arr if str(x).strip()]
+            except Exception:
+                pass
+        parts = [p.strip(" \t-•*·") for p in re.split(r"[\n;；]+", s)]
+        parts = [p for p in parts if p]
+        if len(parts) >= 2:
+            return parts
+        return [s] if s else []
+    return v
 
 
 # --------------------------------------------------------------------------
@@ -543,12 +571,14 @@ def process_message(msg):
             DS.note_hit("selectAction_rewritten" if sent_args != arguments else "selectAction_exact")
         # 参数还原：schema 里我们把 value / initialStateInJson 声明为 string
         # （百工约定会把 object/array 以 JSON 字符串注入），这里还原成真实类型再给上游。
-        for _k in ("value", "initialStateInJson"):
+        for _k in ("value", "initialStateInJson", "options"):
             if _k in sent_args and isinstance(sent_args[_k], str):
                 try:
                     sent_args[_k] = json.loads(sent_args[_k])
                 except Exception:
                     pass  # 不是合法 JSON 就按普通字符串用
+        if "options" in sent_args:
+            sent_args["options"] = coerce_options(sent_args["options"])
         resp = UP.request(method, {"name": name, "arguments": sent_args})
         if name == "selectAction" and not (resp.get("result") or {}).get("isError"):
             DS.note_choice(arguments.get("gameId", ""))

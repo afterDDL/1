@@ -34,7 +34,7 @@ tools = merged["result"]["tools"]
 ck("工具数 = 1", len(tools) == 1, "got %d" % len(tools))
 ck("工具名 = rpg", tools[0]["name"] == "rpg", tools[0]["name"])
 props = tools[0]["inputSchema"]["properties"]
-ck("参数 8 个", len(props) == 8, "got %d: %s" % (len(props), list(props)))
+ck("参数 9 个", len(props) == 9, "got %d: %s" % (len(props), list(props)))
 ck("required = ['action']", tools[0]["inputSchema"]["required"] == ["action"])
 ck("每个参数都有 description", all(p.get("description") for p in props.values()),
    [k for k, v in props.items() if not v.get("description")])
@@ -78,6 +78,24 @@ ck("value=0 不被当成空值丢弃", err is None and kept.get("value") == 0, k
 
 a, kept, err = gw.dispatch_merged({"action": "selectAction", "gameId": "x"})
 ck("selectAction 两个选项参数都没有 → 报错", err is not None and "selectedOption" in err, err)
+
+a, kept, err = gw.dispatch_merged({"action": "promptUserActions", "gameId": "x"})
+ck("promptUserActions 缺 options → 报错（这是上游的硬要求）",
+   err is not None and "options" in err, err)
+
+a, kept, err = gw.dispatch_merged({"action": "promptUserActions", "gameId": "x",
+                                   "options": ["A", "B"]})
+ck("promptUserActions 带 options → 通过", err is None and kept["options"] == ["A", "B"], err)
+
+print("=== 3.5 options 归一化（模型给数组的三种歪法）===")
+ck("真数组原样", gw.coerce_options(["A", "B"]) == ["A", "B"])
+ck("JSON 串还原", gw.coerce_options('["A","B"]') == ["A", "B"])
+ck("JSON 串里带空元素被剔", gw.coerce_options('["A","","B"]') == ["A", "B"])
+ck("换行文本切段", gw.coerce_options("A\nB\nC") == ["A", "B", "C"])
+ck("中文分号切段", gw.coerce_options("A；B") == ["A", "B"])
+ck("项目符号被清掉", gw.coerce_options("- A\n- B") == ["A", "B"])
+ck("单项也保留（上游会判错，但不该丢数据）", gw.coerce_options("只有一项") == ["只有一项"])
+ck("空串 → 空数组", gw.coerce_options("") == [])
 
 print("=== 4. 错误响应的形状（工具层而非协议层报错）===")
 resp = gw.process_message({"jsonrpc": "2.0", "id": 9, "method": "tools/call",
